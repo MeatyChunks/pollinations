@@ -1,467 +1,282 @@
-import os
-import sys
 import io
-import base64
-import logging
-import asyncio
+import os
 import torch
-import aiohttp
-import requests
+import logging
 import numpy as np
 from PIL import Image
-from diffusers import ZImagePipeline
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from realesrgan import RealESRGANer
-from gfpgan import GFPGANer
-import mediapipe as mp
-import time
-from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-import threading
-import warnings
-from contextlib import asynccontextmanager
-import math
-from scipy import ndimage
-from utility import StableDiffusionSafetyChecker, replace_numpy_with_python, replace_sets_with_lists, numpy_to_pil
-from transformers import AutoFeatureExtractor
+from typing import Optional
+from pydantic import BaseModel
+from diffusers import FluxPipeline
+from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Depends, Header
 
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-os.environ["TQDM_DISABLE"] = "1"
-warnings.filterwarnings("ignore")
-
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    datefmt="%H:%M:%S"
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-for noisy in ["httpx", "httpcore", "urllib3", "diffusers", "transformers", "huggingface_hub"]:
-    logging.getLogger(noisy).setLevel(logging.WARNING)
 
+app = FastAPI()
 
-def get_public_ip():
-    try:
-        response = requests.get('https://api.ipify.org', timeout=5)
-        return response.text
-    except Exception:
-        return None
-
-
-async def send_heartbeat():
-    public_ip = os.getenv("PUBLIC_IP")
-    if not public_ip:
-        public_ip = await asyncio.get_event_loop().run_in_executor(None, get_public_ip)
-    if public_ip:
-        try:
-            port = int(os.getenv("PUBLIC_PORT", os.getenv("PORT", "10002")))
-            url = f"http://{public_ip}:{port}"
-            service_type = os.getenv("SERVICE_TYPE", "zimage")
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    'https://image.pollinations.ai/register',
-                    json={'url': url, 'type': service_type}
-                ) as response:
-                    if response.status == 200:
-                        logger.info(f"Heartbeat sent successfully. URL: {url}, type: {service_type}")
-                    else:
-                        logger.error(f"Failed to send heartbeat. Status: {response.status}")
-        except Exception as e:
-            logger.error(f"Error sending heartbeat: {e}")
-
-
-async def periodic_heartbeat():
-    while True:
-        try:
-            await send_heartbeat()
-            await asyncio.sleep(30)
-        except asyncio.CancelledError:
-            logger.info("Heartbeat task cancelled")
-            raise
-        except Exception as e:
-            logger.error(f"Error in periodic heartbeat: {e}")
-            await asyncio.sleep(5)
-
-
-MODEL_ID = "Tongyi-MAI/Z-Image-Turbo"
-MODEL_CACHE = "model_cache"
-UPSCALER_MODEL_x2 = "model_cache/RealESRGAN_x2plus.pth"
-FACE_ENHANCER_MODEL = "model_cache/GFPGANv1.4.pth"
-SAFETY_NSFW_MODEL = "CompVis/stable-diffusion-safety-checker"
-UPSCALE_FACTOR = 2
-MIN_GEN_PIXELS = 512 * 512  # Upscale when generating at 512x512 or larger (final size >= 1024x1024)
-MAX_FINAL_SIZE = 2048
-
-generate_lock = threading.Lock()
-
+# Global variable to store the pipeline
+pipe = None
 
 class ImageRequest(BaseModel):
-    prompts: list[str] = Field(default=["a photo of an astronaut riding a horse on mars"], min_length=1)
-    width: int = Field(default=1024, le=4096)
-    height: int = Field(default=1024, le=4096)
-    steps: int = Field(default=9, le=50)
-    seed: int | None = None
+    prompt: str
+    width: int = 1024
+    height: int = 1024
+    seed: Optional[int] = None
+    guidance_scale: float = 3.5
+    num_inference_steps: int = 20
+    max_sequence_length: int = 256
 
-
-def calc_time(start, end, msg):
-    elapsed = end - start
-    print(f"{msg} time: {elapsed:.2f} seconds")
-
-
-def calculate_generation_dimensions(requested_width: int, requested_height: int) -> tuple[int, int, int, int, bool]:
-    """Calculate generation dimensions and whether to upscale.
-    
-    Returns: (gen_w, gen_h, final_w, final_h, should_upscale)
-    - Cap final size to MAX_FINAL_SIZE (preserving aspect ratio)
-    - If halved resolution >= MIN_GEN_PIXELS: generate at half, upscale 2x
-    - Otherwise: generate at requested resolution, no upscaling
-    """
-    # Cap final dimensions to MAX_FINAL_SIZE, preserving aspect ratio
-    final_w, final_h = requested_width, requested_height
-    if final_w > MAX_FINAL_SIZE or final_h > MAX_FINAL_SIZE:
-        scale = min(MAX_FINAL_SIZE / final_w, MAX_FINAL_SIZE / final_h)
-        final_w = int(final_w * scale)
-        final_h = int(final_h * scale)
-    
-    halved_w = final_w // UPSCALE_FACTOR
-    halved_h = final_h // UPSCALE_FACTOR
-    halved_pixels = halved_w * halved_h
-    
-    if halved_pixels >= MIN_GEN_PIXELS:
-        # Large request: generate at half resolution, then upscale
-        gen_w, gen_h = halved_w, halved_h
-        should_upscale = True
-    else:
-        # Small request: generate at full resolution, no upscaling
-        gen_w, gen_h = final_w, final_h
-        should_upscale = False
-    
-    # Align to 16px multiples (required by model)
-    if gen_w % 16 != 0:
-        gen_w = math.ceil(gen_w / 16) * 16
-    if gen_h % 16 != 0:
-        gen_h = math.ceil(gen_h / 16) * 16
-    
-    # Minimum generation size
-    gen_w = max(gen_w, 256)
-    gen_h = max(gen_h, 256)
-    
-    return gen_w, gen_h, final_w, final_h, should_upscale
-
-
-def detect_faces_mediapipe(image_np, face_detector):
-    """Detect faces using pre-initialized MediaPipe detector."""
-    results = face_detector.process(image_np)
-    if not results.detections:
-        return []
-    h, w = image_np.shape[:2]
-    faces = []
-    for detection in results.detections:
-        bbox = detection.location_data.relative_bounding_box
-        x = int(bbox.xmin * w)
-        y = int(bbox.ymin * h)
-        w_box = int(bbox.width * w)
-        h_box = int(bbox.height * h)
-        x = max(0, x)
-        y = max(0, y)
-        w_box = min(w_box, w - x)
-        h_box = min(h_box, h - y)
-        # Skip invalid face regions
-        if w_box > 0 and h_box > 0:
-            faces.append((x, y, w_box, h_box))
-    return faces
-
-
-def upscale_face_region(face_img_np, face_enhancer):
-    _, _, face_restored = face_enhancer.enhance(
-        face_img_np,
-        has_aligned=False,
-        only_center_face=False,
-        paste_back=True
-    )
-    return face_restored
-
-
-def upscale_background(image_np, upsampler, outscale=UPSCALE_FACTOR):
-    upscaled_np, _ = upsampler.enhance(image_np, outscale=outscale)
-    return upscaled_np
-
-
-def blend_face_region(base_image, face_image, y1, x1, y2, x2, feather_width=20):
-    """Blend face region into base image with feathering to avoid hard edges."""
-    # Ensure bounds are valid
-    y1, x1 = max(0, y1), max(0, x1)
-    y2 = min(base_image.shape[0], y2)
-    x2 = min(base_image.shape[1], x2)
-    
-    h_target = y2 - y1
-    w_target = x2 - x1
-    
-    if h_target <= 0 or w_target <= 0:
-        return
-    
-    # Resize face image to match target region
-    face_resized = face_image[:h_target, :w_target]
-    if face_resized.shape[:2] != (h_target, w_target):
-        face_pil = Image.fromarray(face_resized)
-        face_pil = face_pil.resize((w_target, h_target), Image.Resampling.LANCZOS)
-        face_resized = np.array(face_pil)
-    
-    # Create feathering mask (Gaussian blur on edges)
-    mask = np.ones((h_target, w_target), dtype=np.float32)
-    feather_width = min(feather_width, h_target // 4, w_target // 4)
-    
-    if feather_width > 0:
-        # Create gradient edges
-        for i in range(feather_width):
-            alpha = i / feather_width
-            mask[i, :] *= alpha
-            mask[-(i+1), :] *= alpha
-            mask[:, i] *= alpha
-            mask[:, -(i+1)] *= alpha
-    
-    # Apply alpha blending
-    mask = mask[:, :, np.newaxis]
-    base_image[y1:y2, x1:x2] = (
-        face_resized * mask + 
-        base_image[y1:y2, x1:x2] * (1 - mask)
-    ).astype(np.uint8)
-
-
-# Global model instances (initialized in lifespan)
-pipe = None
-upsampler = None
-face_enhancer = None
-face_detector = None
-heartbeat_task = None
-SAFETY_EXTRACTOR = None
-SAFETY_MODEL = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Handle startup and shutdown of the application."""
-    global pipe, upsampler, face_enhancer, face_detector, heartbeat_task, SAFETY_EXTRACTOR, SAFETY_MODEL
-    
-    logger.info("Starting up...")
-    
-    # Load models
-    load_model_time = time.time()
-    try:
-        pipe = ZImagePipeline.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.bfloat16,
-            cache_dir=MODEL_CACHE,
-            low_cpu_mem_usage=False,  # Faster loading
-        ).to("cuda")
-        
-        model_x2 = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
-        upsampler = RealESRGANer(
-            scale=2,
-            model_path=UPSCALER_MODEL_x2,
-            model=model_x2,
-            tile=768,
-            tile_pad=0,
-            pre_pad=0,
-            half=True,
-            device="cuda"
-        )
-        
-        face_enhancer = GFPGANer(
-            model_path=FACE_ENHANCER_MODEL,
-            upscale=2,
-            arch='clean',
-            channel_multiplier=2,
-            bg_upsampler=upsampler,
-            device="cuda"
-        )
-        
-        # Initialize MediaPipe face detector once
-        mp_face_detection = mp.solutions.face_detection
-        face_detector = mp_face_detection.FaceDetection(
-            model_selection=1,
-            min_detection_confidence=0.5
-        )
-        
-        # Initialize NSFW safety checker
-        SAFETY_EXTRACTOR = AutoFeatureExtractor.from_pretrained(
-            SAFETY_NSFW_MODEL,
-            cache_dir="model_cache"
-        )
-        SAFETY_MODEL = StableDiffusionSafetyChecker.from_pretrained(
-            SAFETY_NSFW_MODEL,
-            cache_dir="model_cache"
-        ).to("cuda")
-        
-        load_model_time_end = time.time()
-        calc_time(load_model_time, load_model_time_end, "Time to load models")
-        logger.info("Models loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to load models: {e}")
-        raise
-    
-    # Start heartbeat task
-    heartbeat_task = asyncio.create_task(periodic_heartbeat())
-    
-    yield
-    
-    # Cleanup
-    if heartbeat_task:
-        heartbeat_task.cancel()
-        try:
-            await heartbeat_task
-        except asyncio.CancelledError:
-            pass
-    
-    logger.info("Shutting down...")
-    if face_detector:
-        face_detector.close()
-
-
-app = FastAPI(title="Z-Image-Turbo API", lifespan=lifespan)
-
-
-def verify_enter_token(x_enter_token: str = Header(None, alias="x-enter-token")):
+# Add token verification
+def verify_enter_token(x_enter_token: Optional[str] = Header(None)):
     expected_token = os.getenv("ENTER_TOKEN")
-    if not expected_token:
-        logger.warning("ENTER_TOKEN not configured - allowing request")
-        return True
-    if x_enter_token != expected_token:
-        logger.warning("Invalid or missing ENTER_TOKEN")
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    if expected_token and x_enter_token != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid or missing token")
     return True
 
+def load_model():
+    """Load the Flux model pipeline"""
+    global pipe
+    try:
+        logger.info("Starting model load...")
+        pipe = FluxPipeline.from_pretrained(
+            "black-forest-labs/FLUX.1-schnell",
+            torch_dtype=torch.bfloat16
+        )
+        logger.info("Model loaded, moving to CUDA...")
+        pipe.to("cuda")
+        logger.info("Model ready on CUDA")
+    except Exception as e:
+        logger.error(f"Failed to load model: {str(e)}")
+        raise
 
-def check_nsfw(image_array, safety_checker_adj: float = 0.0):
-    if isinstance(image_array, np.ndarray):
-        if image_array.max() <= 1.0:
-            image_array = (image_array * 255).astype("uint8")
-        else:
-            image_array = image_array.astype("uint8")
-        x_image = Image.fromarray(image_array)
-        x_image = [x_image]
-    elif isinstance(image_array, list) and not isinstance(image_array[0], Image.Image):
-        x_image = numpy_to_pil(image_array)
+@app.on_event("startup")
+async def startup_event():
+    """Load model on startup"""
+    load_model()
+
+@app.get("/health")
+def health():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "model_loaded": pipe is not None
+    }
+
+def calculate_generation_dimensions(target_w: int, target_h: int):
+    """
+    Calculate optimal generation dimensions and whether upscaling is needed.
+    
+    Args:
+        target_w: Target width requested by user
+        target_h: Target height requested by user
+    
+    Returns:
+        tuple: (generation_width, generation_height, final_width, final_height, should_upscale)
+    """
+    # Maximum dimension for direct generation
+    MAX_DIRECT_DIM = 1024
+    # Minimum dimension to avoid quality issues
+    MIN_DIM = 256
+    # Tile size for upscaling
+    TILE_SIZE = 1024
+    
+    # If both dimensions are at or below MAX_DIRECT_DIM, generate directly at target size
+    if target_w <= MAX_DIRECT_DIM and target_h <= MAX_DIRECT_DIM:
+        # Ensure dimensions are multiples of 8 (required by model)
+        gen_w = (target_w // 8) * 8
+        gen_h = (target_h // 8) * 8
+        return gen_w, gen_h, gen_w, gen_h, False
+    
+    # For larger images, we need to generate at a lower resolution and upscale
+    aspect_ratio = target_w / target_h
+    
+    # Calculate generation dimensions that maintain aspect ratio
+    # and are close to MAX_DIRECT_DIM
+    if aspect_ratio > 1:
+        # Landscape
+        gen_w = MAX_DIRECT_DIM
+        gen_h = int(MAX_DIRECT_DIM / aspect_ratio)
     else:
-        x_image = image_array if isinstance(image_array, list) else [image_array]
-    safety_checker_input = SAFETY_EXTRACTOR(x_image, return_tensors="pt").to("cuda")
-    has_nsfw_concept, concepts = SAFETY_MODEL(
-        images=x_image,
-        clip_input=safety_checker_input.pixel_values
-    )
-    has_nsfw_bool = bool(has_nsfw_concept[0])
-    return (
-        has_nsfw_bool,
-        replace_numpy_with_python(replace_sets_with_lists(concepts[0] if isinstance(concepts, list) else concepts))
-    )
+        # Portrait or square
+        gen_h = MAX_DIRECT_DIM
+        gen_w = int(MAX_DIRECT_DIM * aspect_ratio)
+    
+    # Ensure generation dimensions are multiples of 8 and above minimum
+    gen_w = max(MIN_DIM, (gen_w // 8) * 8)
+    gen_h = max(MIN_DIM, (gen_h // 8) * 8)
+    
+    # Final dimensions should match the request
+    final_w = target_w
+    final_h = target_h
+    
+    return gen_w, gen_h, final_w, final_h, True
 
+def upscale_image(image: Image.Image, target_width: int, target_height: int) -> Image.Image:
+    """
+    Upscale an image to target dimensions using high-quality resampling.
+    
+    Args:
+        image: PIL Image to upscale
+        target_width: Target width
+        target_height: Target height
+    
+    Returns:
+        Upscaled PIL Image
+    """
+    logger.info(f"Upscaling from {image.size} to {target_width}x{target_height}")
+    
+    # Use Lanczos resampling for high quality
+    upscaled = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+    
+    return upscaled
+
+def generate_image(
+    prompt: str,
+    width: int,
+    height: int,
+    seed: int,
+    guidance_scale: float,
+    num_inference_steps: int,
+    max_sequence_length: int,
+    generator: torch.Generator
+) -> Image.Image:
+    """
+    Generate an image using the Flux pipeline.
+    
+    Args:
+        prompt: Text prompt for image generation
+        width: Width of the image to generate
+        height: Height of the image to generate
+        seed: Random seed for reproducibility
+        guidance_scale: Guidance scale for generation
+        num_inference_steps: Number of inference steps
+        max_sequence_length: Maximum sequence length for text encoding
+        generator: PyTorch random generator
+    
+    Returns:
+        Generated PIL Image
+    """
+    logger.info(f"Generating image: {width}x{height}, prompt: '{prompt[:50]}...'")
+    
+    try:
+        result = pipe(
+            prompt=prompt,
+            width=width,
+            height=height,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            max_sequence_length=max_sequence_length,
+            generator=generator
+        )
+        
+        if result.images and len(result.images) > 0:
+            return result.images[0]
+        else:
+            raise ValueError("No image generated")
+            
+    except Exception as e:
+        logger.error(f"Error during image generation: {str(e)}")
+        raise
+
+def image_to_bytes(image: Image.Image, format: str = "PNG") -> bytes:
+    """
+    Convert a PIL Image to bytes.
+    
+    Args:
+        image: PIL Image to convert
+        format: Output format (PNG, JPEG, etc.)
+    
+    Returns:
+        Image as bytes
+    """
+    img_byte_arr = io.BytesIO()
+    image.save(img_byte_arr, format=format)
+    img_byte_arr.seek(0)
+    return img_byte_arr.getvalue()
+
+def resize_to_multiple_of_8(width: int, height: int) -> tuple:
+    """
+    Ensure dimensions are multiples of 8.
+    
+    Args:
+        width: Requested width
+        height: Requested height
+    
+    Returns:
+        tuple: (adjusted_width, adjusted_height)
+    """
+    return (width // 8) * 8, (height // 8) * 8
+
+@app.post("/")
+def root_generate(request: ImageRequest, _auth: bool = Depends(verify_enter_token)):
+    """Root endpoint that accepts POST requests"""
+    return generate(request, _auth)
 
 @app.post("/generate")
 def generate(request: ImageRequest, _auth: bool = Depends(verify_enter_token)):
     logger.info(f"Request: {request}")
     if pipe is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    # Use 1024 as default only if both dimensions are default
+    # If one is specified, scale the other to maintain aspect ratio
+    width = request.width
+    height = request.height
+    if width == 1024 and height == 1024:
+        # Both are defaults - keep them
+        pass
+    elif width == 1024 and height != 1024:
+        # Only height was specified - scale width proportionally (assume square)
+        width = height
+    elif height == 1024 and width != 1024:
+        # Only width was specified - scale height proportionally (assume square)
+        height = width
+    
     seed = request.seed if request.seed is not None else int.from_bytes(os.urandom(8), "big")
     logger.info(f"Using seed: {seed}")
     generator = torch.Generator("cuda").manual_seed(seed)
-    gen_w, gen_h, final_w, final_h, should_upscale = calculate_generation_dimensions(request.width, request.height)
-    logger.info(f"Requested: {request.width}x{request.height} -> Generation: {gen_w}x{gen_h} -> Final: {final_w}x{final_h} (upscale: {should_upscale})")
+    gen_w, gen_h, final_w, final_h, should_upscale = calculate_generation_dimensions(width, height)
+    logger.info(f"Requested: {width}x{height} -> Generation: {gen_w}x{gen_h} -> Final: {final_w}x{final_h} (upscale: {should_upscale})")
     
     try:
-        # Lock entire pipeline: generation + upscaling (to prevent concurrent GPU ops)
-        with generate_lock:
-            with torch.inference_mode():
-                output = pipe(
-                    prompt=request.prompts[0],
-                    generator=generator,
-                    width=gen_w,
-                    height=gen_h,
-                    num_inference_steps=request.steps,
-                    guidance_scale=0.0,
-                )
-            image = output.images[0]
-            image_np = np.array(image)
-            
-            # Check for NSFW content
-            has_nsfw, concepts = check_nsfw(image_np, safety_checker_adj=0.0)
-            if has_nsfw:
-                raise HTTPException(status_code=400, detail="NSFW content detected")
-            
-            if should_upscale:
-                # Detect faces for face-aware upscaling
-                faces = detect_faces_mediapipe(image_np, face_detector)
-                
-                if len(faces) > 0:
-                    logger.info(f"Detected {len(faces)} face(s). Using face-aware upscaling...")
-                    base_upscaled = upscale_background(image_np, upsampler)
-                    
-                    for idx, (x, y, w, h) in enumerate(faces):
-                        padding = int(max(w, h) * 0.3)
-                        x1 = max(0, x - padding)
-                        y1 = max(0, y - padding)
-                        x2 = min(image_np.shape[1], x + w + padding)
-                        y2 = min(image_np.shape[0], y + h + padding)
-                        
-                        face_region = image_np[y1:y2, x1:x2]
-                        if face_region.shape[0] < 10 or face_region.shape[1] < 10:
-                            logger.info(f"Skipping face {idx + 1} (too small)")
-                            continue
-                        
-                        face_upscaled = upscale_face_region(face_region, face_enhancer)
-                        
-                        # Blend with feathering instead of hard paste
-                        x1_up = x1 * UPSCALE_FACTOR
-                        y1_up = y1 * UPSCALE_FACTOR
-                        x2_up = (x2) * UPSCALE_FACTOR
-                        y2_up = (y2) * UPSCALE_FACTOR
-                        
-                        blend_face_region(base_upscaled, face_upscaled, y1_up, x1_up, y2_up, x2_up, feather_width=20)
-                    
-                    result = base_upscaled
-                else:
-                    logger.info("No faces detected. Using standard RealESRGAN upscaling...")
-                    result = upscale_background(image_np, upsampler)
-            else:
-                # No upscaling needed - use generated image directly
-                logger.info("Small resolution - skipping upscaling")
-                result = image_np
-            
-            # Crop to final dimensions
-            h_current, w_current = result.shape[:2]
-            if h_current > final_h or w_current > final_w:
-                y_start = (h_current - final_h) // 2
-                x_start = (w_current - final_w) // 2
-                result = result[y_start:y_start + final_h, x_start:x_start + final_w]
-            
-            upscaled_image = Image.fromarray(result)
+        # Generate image at calculated generation dimensions
+        image = generate_image(
+            prompt=request.prompt,
+            width=gen_w,
+            height=gen_h,
+            seed=seed,
+            guidance_scale=request.guidance_scale,
+            num_inference_steps=request.num_inference_steps,
+            max_sequence_length=request.max_sequence_length,
+            generator=generator
+        )
         
-        # Encode image (outside lock for faster response)
-        img_byte_arr = io.BytesIO()
-        upscaled_image.save(img_byte_arr, format='JPEG', quality=95)
-        img_base64 = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-        response_content = [{
-            "image": img_base64,
-            "has_nsfw_concept": False,
-            "concept": [],
-            "width": upscaled_image.width,
-            "height": upscaled_image.height,
-            "seed": seed,
-            "prompt": request.prompts[0]
-        }]
-        return JSONResponse(content=response_content)
-    except torch.cuda.OutOfMemoryError as e:
-        logger.error(f"CUDA OOM Error: {e} - Exiting to trigger restart")
-        sys.exit(1)
-
-
-@app.get("/health")
-async def health():
-    if pipe is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    return {"status": "healthy", "model": MODEL_ID}
-
+        # Upscale if needed
+        if should_upscale:
+            image = upscale_image(image, final_w, final_h)
+        
+        # Convert to bytes and return
+        image_bytes = image_to_bytes(image)
+        
+        return Response(
+            content=image_bytes,
+            media_type="image/png",
+            headers={
+                "X-Seed": str(seed),
+                "X-Generation-Dimensions": f"{gen_w}x{gen_h}",
+                "X-Final-Dimensions": f"{final_w}x{final_h}",
+                "X-Upscaled": str(should_upscale)
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error generating image: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "10002"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
